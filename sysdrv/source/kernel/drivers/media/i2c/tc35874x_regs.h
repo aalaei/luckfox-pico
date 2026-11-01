@@ -567,6 +567,21 @@
 #define LOCKDET_REF1                          0x8631
 #define LOCKDET_REF2                          0x8632
 
+/*
+ * Received ACR CTS and N values from HDMI ACR packets.
+ * LOCKDET_REF0-2 (above) are write-only for lock-detector configuration;
+ * reading the same I2C addresses returns the most recently received 20-bit
+ * CTS value.  N is at the next 3-byte slot.  Both are little-endian.
+ * Reference: TC358743/TC358749 Functional Specification, audio clock section.
+ */
+#define HDMI_RCV_CTS0                         0x8630  /* CTS[7:0]   (read) */
+#define HDMI_RCV_CTS1                         0x8631  /* CTS[15:8]  (read) */
+#define HDMI_RCV_CTS2                         0x8632  /* CTS[19:16] (read) */
+
+#define HDMI_RCV_N0                           0x8634  /* N[7:0]     (read) */
+#define HDMI_RCV_N1                           0x8635  /* N[15:8]    (read) */
+#define HDMI_RCV_N2                           0x8636  /* N[19:16]   (read) */
+
 #define ACR_MODE                              0x8640
 #define MASK_ACR_LOAD                         0x10
 #define MASK_N_MODE                           0x04
@@ -620,6 +635,7 @@
 #define MASK_NCO_F0_MOD                       0x03
 #define MASK_NCO_F0_MOD_42MHZ                 0x00
 #define MASK_NCO_F0_MOD_27MHZ                 0x01
+#define MASK_NCO_F0_MOD_26MHZ                 0x02
 
 #define PK_INT_MODE                           0x8709
 #define MASK_ISRC2_INT_MODE                   0x80

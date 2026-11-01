@@ -27,6 +27,7 @@
  */
 
 #include <linux/kernel.h>
+#include <linux/math64.h>
 #include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/i2c.h>
@@ -55,6 +56,22 @@
 static int debug;
 module_param(debug, int, 0644);
 MODULE_PARM_DESC(debug, "debug level (0-3)");
+
+/*
+ * force_hpd: HDMI dummy-plug mode. When set, HPD is held high and the EDID
+ * stays readable regardless of the source's +5V, so the source always sees
+ * a display. Matches the parameter of Luckfox's stock PicoKVM driver; the
+ * kvm_app writes /sys/module/tc35874x/parameters/force_hpd at runtime.
+ */
+static int force_hpd = 1;
+static int tc35874x_force_hpd_set(const char *val,
+				  const struct kernel_param *kp);
+static const struct kernel_param_ops force_hpd_ops = {
+	.set = tc35874x_force_hpd_set,
+	.get = param_get_int,
+};
+module_param_cb(force_hpd, &force_hpd_ops, &force_hpd, 0644);
+MODULE_PARM_DESC(force_hpd, "Force HPD high (HDMI dummy plug mode, always report display connected) (0-1, default 1)");
 
 MODULE_DESCRIPTION("Toshiba TC35874X HDMI to CSI-2 bridge driver");
 MODULE_AUTHOR("Ramakrishnan Muthukrishnan <ram@rkrishnan.org>");
@@ -404,16 +421,73 @@ static inline bool audio_present(struct v4l2_subdev *sd)
 	return i2c_rd8(sd, AU_STATUS0) & MASK_S_A_SAMPLE;
 }
 
+/*
+ * Compute the true audio sample rate from the CTS and N values received in
+ * HDMI ACR packets plus the detected pixel clock.
+ *
+ * Per HDMI 1.4 spec section 7.2:
+ *   f_audio = (f_pixel × N) / (128 × CTS)
+ *
+ * Using the ACR-derived rate instead of the coarse FS_SET code prevents
+ * pitch-shift that occurs when the HDMI source pixel clock deviates from
+ * the nominal value (e.g. 148.35 MHz vs 148.5 MHz for 1080p60), which
+ * changes CTS while N stays fixed, shifting the true audio frequency away
+ * from the nominal 48 000 Hz that FS_SET would report.
+ *
+ * Returns the computed rate in Hz, or 0 if the registers are not yet valid.
+ */
+static int get_audio_sampling_rate_acr(struct v4l2_subdev *sd)
+{
+	struct tc35874x_state *state = to_state(sd);
+	u32 cts, n;
+	u64 rate;
+
+	if (!state->timings.bt.pixelclock)
+		return 0;
+
+	/*
+	 * Reading HDMI_RCV_CTS0/N0 returns the 20-bit CTS/N values most
+	 * recently received from the HDMI source as 3-byte little-endian words.
+	 * (The same I2C addresses are written at init time for LOCKDET_REF
+	 * configuration; reads return the received ACR values, not that config.)
+	 */
+	cts = i2c_rdreg(sd, HDMI_RCV_CTS0, 3) & 0x000fffff;
+	n   = i2c_rdreg(sd, HDMI_RCV_N0,   3) & 0x000fffff;
+
+	if (!cts || !n)
+		return 0;
+
+	rate = div64_u64((u64)state->timings.bt.pixelclock * n,
+			 (u64)128 * cts);
+
+	v4l2_dbg(1, debug, sd,
+		 "%s: pixelclock=%llu N=%u CTS=%u -> %llu Hz\n",
+		 __func__, state->timings.bt.pixelclock, n, cts, rate);
+
+	return (int)rate;
+}
+
 static int get_audio_sampling_rate(struct v4l2_subdev *sd)
 {
 	static const int code_to_rate[] = {
 		44100, 0, 48000, 32000, 22050, 384000, 24000, 352800,
 		88200, 768000, 96000, 705600, 176400, 0, 192000, 0
 	};
+	int acr_rate;
 
 	/* Register FS_SET is not cleared when the cable is disconnected */
 	if (no_signal(sd))
 		return 0;
+
+	/*
+	 * Prefer the ACR-computed rate: it reflects the true audio clock
+	 * derived from the HDMI source's actual pixel clock, CTS, and N.
+	 * Fall back to the FS_SET nominal code only when CTS/N are not yet
+	 * available (e.g. DVI source, or before the first ACR packet).
+	 */
+	acr_rate = get_audio_sampling_rate_acr(sd);
+	if (acr_rate > 0)
+		return acr_rate;
 
 	return code_to_rate[i2c_rd8(sd, FS_SET) & MASK_FS];
 }
@@ -551,9 +625,27 @@ static void tc35874x_disable_edid(struct v4l2_subdev *sd)
 
 	cancel_delayed_work_sync(&state->delayed_work_enable_hotplug);
 
+	if (force_hpd && state->edid_blocks_written) {
+		v4l2_dbg(1, debug, sd,
+			 "%s: Dummy plug mode - ignoring 5V power change, keeping HPD high\n",
+			 __func__);
+		return;
+	}
+
 	/* DDC access to EDID is also disabled when hotplug is disabled. See
 	 * register DDC_CTL */
 	i2c_wr8_and_or(sd, HPD_CTL, ~MASK_HPD_OUT0, 0x0);
+}
+
+static void tc35874x_force_hpd_high(struct v4l2_subdev *sd)
+{
+	struct tc35874x_state *state = to_state(sd);
+
+	if (!state->edid_blocks_written)
+		return;
+	v4l2_dbg(1, debug, sd, "%s: HPD forced high (dummy plug mode)\n",
+		 __func__);
+	i2c_wr8_and_or(sd, HPD_CTL, ~MASK_HPD_OUT0, MASK_HPD_OUT0);
 }
 
 static void tc35874x_enable_edid(struct v4l2_subdev *sd)
@@ -574,6 +666,38 @@ static void tc35874x_enable_edid(struct v4l2_subdev *sd)
 
 	tc35874x_enable_interrupts(sd, true);
 	tc35874x_s_ctrl_detect_tx_5v(sd);
+}
+
+/* Device bound to this driver, for applying force_hpd changes at runtime. */
+static struct tc35874x_state *force_hpd_state;
+static DEFINE_MUTEX(force_hpd_lock);
+
+static int tc35874x_force_hpd_set(const char *val,
+				  const struct kernel_param *kp)
+{
+	int ret, v;
+
+	ret = kstrtoint(val, 0, &v);
+	if (ret)
+		return ret;
+	if (v != 0 && v != 1)
+		return -EINVAL;
+
+	mutex_lock(&force_hpd_lock);
+	force_hpd = v;
+	if (force_hpd_state) {
+		struct v4l2_subdev *sd = &force_hpd_state->sd;
+
+		if (force_hpd)
+			tc35874x_force_hpd_high(sd);
+		else if (tx_5v_power_present(sd))
+			tc35874x_enable_edid(sd);
+		else
+			tc35874x_disable_edid(sd);
+	}
+	mutex_unlock(&force_hpd_lock);
+
+	return 0;
 }
 
 static void tc35874x_erase_bksv(struct v4l2_subdev *sd)
@@ -795,8 +919,9 @@ static void tc35874x_set_ref_clk(struct v4l2_subdev *sd)
 	i2c_wr8(sd, LOCKDET_REF2, (lockdet_ref & 0x0f0000) >> 16);
 
 	i2c_wr8_and_or(sd, NCO_F0_MOD, ~MASK_NCO_F0_MOD,
-			(pdata->refclk_hz == 27000000) ?
-			MASK_NCO_F0_MOD_27MHZ : 0x0);
+			(pdata->refclk_hz == 27000000) ? MASK_NCO_F0_MOD_27MHZ :
+			(pdata->refclk_hz == 26000000) ? MASK_NCO_F0_MOD_27MHZ :
+			0x0);
 }
 
 static void tc35874x_set_csi_color_space(struct v4l2_subdev *sd)
@@ -1080,7 +1205,8 @@ static void tc35874x_enable_interrupts(struct v4l2_subdev *sd,
 		i2c_wr8(sd, CLK_INTM, ~MASK_M_IN_DE_CHG);
 		i2c_wr8(sd, CBIT_INTM, ~(MASK_M_CBIT_FS | MASK_M_AF_LOCK |
 					MASK_M_AF_UNLOCK) & 0xff);
-		i2c_wr8(sd, AUDIO_INTM, ~MASK_M_BUFINIT_END);
+		i2c_wr8(sd, AUDIO_INTM,
+			~(MASK_M_BUFINIT_END | MASK_M_ACR_CTS) & 0xff);
 		i2c_wr8(sd, MISC_INTM, ~MASK_M_SYNC_CHG);
 	} else {
 		i2c_wr8(sd, SYS_INTM, ~MASK_M_DDC & 0xff);
@@ -1100,6 +1226,18 @@ static void tc35874x_hdmi_audio_int_handler(struct v4l2_subdev *sd,
 	i2c_wr8(sd, AUDIO_INT, audio_int);
 
 	v4l2_dbg(3, debug, sd, "%s: AUDIO_INT = 0x%02x\n", __func__, audio_int);
+
+	if (audio_int & MASK_I_ACR_CTS) {
+		/*
+		 * A new CTS value arrived from the HDMI source.  Recompute
+		 * the audio sample rate so the ALSA layer can be informed of
+		 * the accurate (ACR-derived) frequency before capture starts.
+		 */
+		v4l2_dbg(1, debug, sd, "%s: ACR CTS updated\n", __func__);
+		audio_int &= ~MASK_I_ACR_CTS;
+		if (handled)
+			*handled = true;
+	}
 
 	tc35874x_s_ctrl_audio_sampling_rate(sd);
 	tc35874x_s_ctrl_audio_present(sd);
@@ -2410,6 +2548,14 @@ static int tc35874x_probe(struct i2c_client *client,
 
 	tc35874x_s_edid(sd, &def_edid);
 
+	mutex_lock(&force_hpd_lock);
+	force_hpd_state = state;
+	if (force_hpd) {
+		v4l2_info(sd, "HDMI dummy plug mode enabled - HPD forced high, EDID always available\n");
+		tc35874x_force_hpd_high(sd);
+	}
+	mutex_unlock(&force_hpd_lock);
+
 	tc35874x_init_interrupts(sd);
 
 	if (state->i2c_client->irq) {
@@ -2442,6 +2588,10 @@ static int tc35874x_probe(struct i2c_client *client,
 	return 0;
 
 err_work_queues:
+	mutex_lock(&force_hpd_lock);
+	if (force_hpd_state == state)
+		force_hpd_state = NULL;
+	mutex_unlock(&force_hpd_lock);
 	if (!state->i2c_client->irq)
 		flush_work(&state->work_i2c_poll);
 	cancel_delayed_work(&state->delayed_work_enable_hotplug);
@@ -2456,6 +2606,11 @@ static int tc35874x_remove(struct i2c_client *client)
 {
 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
 	struct tc35874x_state *state = to_state(sd);
+
+	mutex_lock(&force_hpd_lock);
+	if (force_hpd_state == state)
+		force_hpd_state = NULL;
+	mutex_unlock(&force_hpd_lock);
 
 	if (!state->i2c_client->irq) {
 		del_timer_sync(&state->timer);
